@@ -1,0 +1,24 @@
+name: Verify Public Worker Setup
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-public-worker.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify worker key exists without printing it
+        env:
+          AYAH_API_KEY: ${{ secrets.AYAH_API_KEY }}
+        run: |
+          test -n "$AYAH_API_KEY" || { echo "::error::AYAH_API_KEY secret is missing"; exit 1; }
+          echo "Secret is configured."
+      - name: Confirm generator is reachable without claiming tasks
+        run: |
+          curl --fail --silent --show-error --location --max-time 20 --output /dev/null "https://khaled.elevatefollowers.com/"
+          echo "Generator is reachable."
