@@ -1,0 +1,232 @@
+name: Ayah Scheduled Worker
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ayah-scheduled-worker
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Verify secret is configured
+        env:
+          AYAH_API_KEY: ${{ secrets.AYAH_API_KEY }}
+        run: |
+          if [ -z "$AYAH_API_KEY" ]; then
+            echo "AYAH_API_KEY repository secret is missing. No tasks were claimed."
+            exit 1
+          fi
+
+      - name: Claim due task
+        env:
+          AYAH_API_KEY: ${{ secrets.AYAH_API_KEY }}
+        run: |
+          curl -sS --fail-with-body -H "X-API-Key: ${AYAH_API_KEY}" \
+            "https://khaled.elevatefollowers.com/worker-api.php?action=claim" -o task-response.json
+          jq '{success, has_task:(.task != null), task_id:(.task.id // null)}' task-response.json
+          jq -e '.success == true' task-response.json >/dev/null
+          if [ "$(jq -r '.task // empty' task-response.json)" = "" ]; then
+            echo "NO_TASK=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "NO_TASK=0" >> "$GITHUB_ENV"
+          jq -c '.task' task-response.json > task.json
+
+      - name: Setup Node.js
+        if: env.NO_TASK == '0'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install Playwright
+        if: env.NO_TASK == '0'
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Generate scheduled videos
+        if: env.NO_TASK == '0'
+        run: |
+          mkdir -p output
+          node 2> >(tee worker-error.log >&2) <<'EOF'
+          const { chromium } = await import('playwright');
+          const fs = await import('node:fs');
+          const task = JSON.parse(fs.readFileSync('task.json','utf8'));
+          const p = task.payload;
+          const browser = await chromium.launch({headless:true,args:['--autoplay-policy=no-user-gesture-required']});
+          const context = await browser.newContext({acceptDownloads:true,viewport:{width:1080,height:1920}});
+          const page = await context.newPage();
+          page.on('console',m=>console.log('[BROWSER]',m.type(),m.text()));
+          await page.goto('https://khaled.elevatefollowers.com/',{waitUntil:'domcontentloaded',timeout:60000});
+          await page.waitForTimeout(10000);
+
+          // استخدم نفس مسار الرفع الأصلي داخل الموقع حتى يصل العنوان والكابشن
+          // والكلمات الدلالية والصورة المصغرة، بدل رفع الملف مرة ثانية من GitHub.
+          await page.evaluate(({endpoint,key})=>{
+            const ep=document.getElementById('hostEndpoint');
+            const ak=document.getElementById('hostApiKey');
+            const au=document.getElementById('hostAutoUpload');
+            const kl=document.getElementById('hostKeepLocal');
+            if(ep) ep.value=endpoint || '';
+            if(ak) ak.value=key || '';
+            if(au) au.checked=true;
+            if(kl) kl.checked=true;
+          },{endpoint:p.destination_endpoint,key:p.destination_api_key});
+
+          // استعادة إعدادات الشعار والصوت المحفوظة مع المهمة.
+          await page.evaluate(async p=>{
+            if (typeof applyAudioSettings === 'function') applyAudioSettings({volume:Number(p.audio_volume ?? 1)});
+            if (typeof state !== 'undefined' && state.ambientAudio) {
+              state.ambientAudio.enabled=!!p.ambient_audio_enabled;
+              state.ambientAudio.url=p.ambient_audio_url || 'assets/audio/birds-ambience.wav';
+              state.ambientAudio.fileName=state.ambientAudio.url.split('/').pop() || 'صوت الخلفية';
+              state.ambientAudio.volume=Math.max(0,Math.min(1,Number(p.ambient_audio_volume ?? .18)));
+              if (typeof agSyncAmbientUi === 'function') agSyncAmbientUi();
+            }
+            if (p.logo_enabled && p.logo_url && typeof state !== 'undefined') {
+              const absolute=new URL(p.logo_url,location.href).href;
+              state.logoSettings.url=absolute;
+              const img=new Image(); img.crossOrigin='anonymous';
+              await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=absolute;});
+              state.logoImage=img;
+              if (typeof els !== 'undefined' && els.logoImg) els.logoImg.src=absolute;
+              if (typeof els !== 'undefined' && els.logoBadge) els.logoBadge.style.backgroundImage=`url('${absolute}')`;
+              if (typeof applyLogoSettings === 'function') applyLogoSettings({enabled:true,size:Number(p.logo_size??12),opacity:Number(p.logo_opacity??90),position:p.logo_position||'tr'});
+              if (typeof applyLogoNeonSettings === 'function') applyLogoNeonSettings({color:p.logo_neon_color||'#21c3a0',intensity:Number(p.logo_neon_intensity??60),speed:Number(p.logo_neon_speed??4),animate:!!p.logo_neon_animate});
+              if (typeof refreshLogoVisibility === 'function') refreshLogoVisibility();
+            } else if (typeof applyLogoSettings === 'function') {
+              applyLogoSettings({enabled:false});
+            }
+          },p);
+
+          const batch=page.locator('button').filter({hasText:'مولد فيديوهات القرآن التلقائي'}).first();
+          await batch.evaluate(b=>b.click());
+          await page.waitForTimeout(4000);
+          // Stable field IDs: adding new design selectors must not break the worker.
+          async function pick(id,text){
+            const select=page.locator('#'+id);
+            await select.waitFor({state:'visible',timeout:15000});
+            const options=await select.locator('option').allTextContents();
+            const match=options.find(x=>x.trim().includes(String(text).trim()));
+            if(!match) throw new Error(`Option not found for #${id}: ${text}; available: ${options.join(' | ')}`);
+            await select.selectOption({label:match.trim()});
+            await page.waitForTimeout(300);
+          }
+          await page.locator('#agSurah').selectOption(String(p.surah));
+          await pick('agReciter',p.reciter);
+          await pick('agTranslationSelect',p.translation||'بدون ترجمة');
+          await pick('agTafsirSelect',p.tafsir||'بدون تفسير');
+          const vpvLabel=Number(p.verses_per_video)===1?'آية واحدة':Number(p.verses_per_video)===2?'آيتان':`${p.verses_per_video} آيات`;
+          await pick('agVpv',vpvLabel);
+          await page.locator('#agFormat').selectOption('webm');
+          if(!p.random_background && p.background_label && !p.background_label.includes('استخدم الخلفية الحالية'))
+            await pick('agBackgroundSelect',p.background_label.split('·')[0].trim());
+          // Make scheduled batches vary their persistent cover style per video.
+          // Older saved tasks have no style setting, so random styling is the default.
+          await page.evaluate((payload)=>{
+            const random=document.getElementById('agFixedCoverRandom');
+            const style=document.getElementById('agFixedCoverStyle');
+            if(style && payload.fixed_cover_style != null && !Number.isNaN(Number(payload.fixed_cover_style))){
+              style.value=String(Math.max(0,Math.min(9,Math.floor(Number(payload.fixed_cover_style)))));
+              style.dispatchEvent(new Event('change',{bubbles:true}));
+            }
+            if(random){
+              random.checked=payload.random_fixed_cover !== false;
+              random.dispatchEvent(new Event('change',{bubbles:true}));
+            }
+          },p);
+          // Restore visual effects saved by the generator, before building the queue.
+          await page.evaluate(payload=>{
+            const enabled=document.getElementById('agVisualFxEnabled');
+            const style=document.getElementById('agVisualFxStyle');
+            const random=document.getElementById('agVisualFxRandom');
+            const intensity=document.getElementById('agVisualFxIntensity');
+            if(enabled) enabled.checked=payload.visual_fx_enabled !== false;
+            if(style && payload.visual_fx_style) style.value=String(payload.visual_fx_style);
+            if(random) random.checked=payload.visual_fx_random !== false;
+            if(intensity) intensity.value=String(Math.max(0,Math.min(100,Number(payload.visual_fx_intensity ?? 35))));
+          },p);
+          const create=page.locator('#agBuildQueue');
+          await create.waitFor({state:'visible',timeout:15000});
+          await page.locator('#agFrom').fill(String(p.from_ayah));
+          await page.locator('#agTo').fill(String(p.to_ayah));
+          const randomBtn=page.locator('#agRandomBgBtn');
+          const randomToggle=page.locator('#agRandomBg');
+          if(await randomBtn.count() && await randomToggle.count()){
+            const enabled=await randomToggle.isChecked();
+            if(Boolean(p.random_background)!==enabled) await randomBtn.click({force:true});
+          }
+          await create.click({force:true});
+          await page.waitForTimeout(12000);
+          const expected=Math.ceil((Number(p.to_ayah)-Number(p.from_ayah)+1)/Number(p.verses_per_video||1));
+          let saved=0;
+          let uploaded=0;
+          let uploadError='';
+          const downloadPromises=[];
+          page.on('download',d=>{
+            const n=++saved;
+            const path=`output/video-${String(n).padStart(3,'0')}.webm`;
+            const promise=d.saveAs(path).then(()=>console.log('Saved',path));
+            downloadPromises.push(promise);
+          });
+          page.on('response',async resp=>{
+            try{
+              if(resp.request().method()==='POST' && resp.url()===String(p.destination_endpoint)){
+                const body=await resp.json().catch(()=>null);
+                if(resp.ok() && body && body.ok){
+                  uploaded++;
+                  console.log('Publishing upload accepted',uploaded);
+                }else{
+                  uploadError=(body && (body.error||body.message)) || `HTTP ${resp.status()}`;
+                }
+              }
+            }catch(e){
+              uploadError=e?.message || String(e);
+            }
+          });
+          const start=page.locator('button:visible').filter({hasText:'بدء الإنتاج'}).first();
+          await start.click({force:true});
+          // Large surahs can legitimately take well over 35 minutes. Allow ~90 sec per video + 10 min overhead, with a 35 min minimum.
+          const allowedMs=Math.max(35*60*1000, expected*90*1000 + 10*60*1000);
+          const deadline=Date.now()+allowedMs;
+          console.log(`Expected ${expected} publishing uploads; generation deadline ${Math.round(allowedMs/60000)} minutes`);
+          while((saved<expected || uploaded<expected) && !uploadError && Date.now()<deadline){
+            await page.waitForTimeout(2000);
+          }
+          if(uploadError) throw new Error(`Publishing upload failed: ${uploadError}`);
+          if(saved<expected) throw new Error(`Expected ${expected} downloads, got ${saved}`);
+          if(uploaded<expected) throw new Error(`Expected ${expected} publishing uploads, got ${uploaded}`);
+          await Promise.all(downloadPromises);
+          await browser.close();
+          EOF
+
+      - name: Mark task done
+        if: env.NO_TASK == '0' && success()
+        env:
+          AYAH_API_KEY: ${{ secrets.AYAH_API_KEY }}
+        run: |
+          ID=$(jq -r '.id' task.json)
+          curl -sS --fail-with-body -X POST -H "X-API-Key: ${AYAH_API_KEY}" -H 'Content-Type: application/json' \
+            --data "{\"action\":\"finish\",\"task_id\":${ID},\"status\":\"done\",\"result\":{\"message\":\"generated and uploaded by website with metadata\"}}" \
+            "https://khaled.elevatefollowers.com/worker-api.php"
+
+      - name: Mark task failed
+        if: env.NO_TASK == '0' && failure()
+        env:
+          AYAH_API_KEY: ${{ secrets.AYAH_API_KEY }}
+        run: |
+          ID=$(jq -r '.id // 0' task.json 2>/dev/null || echo 0)
+          [ "$ID" = "0" ] && exit 0
+          DETAIL=$(grep -E 'Error:|TimeoutError:|SyntaxError:|Failed to|Expected ' worker-error.log 2>/dev/null | tail -n 1 | cut -c1-250 || true)
+          [ -n "$DETAIL" ] || DETAIL="GitHub Actions failed; inspect workflow logs"
+          jq -n --argjson task_id "$ID" --arg message "$DETAIL" \
+            '{action:"finish",task_id:$task_id,status:"failed",result:{message:$message}}' > failure-result.json
+          curl -sS -X POST -H "X-API-Key: ${AYAH_API_KEY}" -H 'Content-Type: application/json' \
+            --data-binary @failure-result.json \
+            "https://khaled.elevatefollowers.com/worker-api.php" || true
